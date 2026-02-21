@@ -7,6 +7,70 @@ use std::fmt::Write;
 // todo!("Add any other imports you need here")
 
 // Add any other constants, type aliases, or structs, or definitions here
+// Struct for page header (8 bytes)
+pub struct HeapPageHeader {
+    pub(crate) page_id: PageId,
+    pub(crate) active_slot_count: SlotId,
+    pub(crate) alloc_slot_count: SlotId,
+    pub(crate) slot_boundary: Offset,
+}
+
+impl HeapPageHeader {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let page_id = PageId::from_le_bytes(bytes[..2].try_into().unwrap());
+        let active_slot_count = SlotId::from_le_bytes(bytes[2..4].try_into().unwrap());
+        let alloc_slot_count = SlotId::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let slot_boundary = Offset::from_le_bytes(bytes[6..8].try_into().unwrap());
+        HeapPageHeader {
+            page_id,
+            active_slot_count,
+            alloc_slot_count,
+            slot_boundary,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 8] {
+        let mut bytes = [0u8; 8];
+        bytes[..2].copy_from_slice(&self.page_id.to_le_bytes());
+        bytes[2..4].copy_from_slice(&self.active_slot_count.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.alloc_slot_count.to_le_bytes());
+        bytes[6..8].copy_from_slice(&self.slot_boundary.to_le_bytes());
+        bytes
+    }
+}
+
+pub type Flag = u8;
+
+// Struct for slot header (6 bytes)
+pub struct SlotHeader {
+    pub(crate) offset: Offset,
+    pub(crate) length: Offset,
+    pub(crate) valid: Flag,
+    pub(crate) pad: Flag,
+}
+
+impl SlotHeader {
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let offset = Offset::from_le_bytes(bytes[..2].try_into().unwrap());
+        let length = Offset::from_le_bytes(bytes[2..4].try_into().unwrap());
+        let valid = Flag::from_le_bytes(bytes[4..5].try_into().unwrap());
+        let pad = Flag::from_le_bytes(bytes[5..6].try_into().unwrap());
+        SlotHeader {
+            offset,
+            length,
+            valid,
+            pad,
+        }
+    }
+    pub fn to_bytes(&self) -> [u8; 6] {
+        let mut bytes = [0u8; 6];
+        bytes[..2].copy_from_slice(&self.offset.to_le_bytes());
+        bytes[2..4].copy_from_slice(&self.length.to_le_bytes());
+        bytes[4..5].copy_from_slice(&self.valid.to_le_bytes());
+        bytes[5..6].copy_from_slice(&self.pad.to_le_bytes());
+        bytes
+    }
+}
 
 pub trait HeapPage {
     // Do not change these functions signatures (only the function bodies)
@@ -17,6 +81,12 @@ pub trait HeapPage {
     fn get_free_space(&self) -> usize;
 
     //Add function signatures for any helper function you need here
+    fn get_page_header(&self) -> HeapPageHeader;
+    fn write_page_header(&mut self, header: HeapPageHeader);
+    fn get_slot_header(&self, slot_id: SlotId) -> SlotHeader;
+    fn get_slot_data(&self, slot_id: SlotId) -> &[u8];
+    fn write_slot_header(&mut self, slot_id: SlotId, header: SlotHeader);
+    fn recompact(&mut self) -> ();
 }
 
 impl HeapPage for Page {
@@ -32,12 +102,61 @@ impl HeapPage for Page {
     /// They must have the same size.
     /// self.data[X..y].clone_from_slice(&bytes);
     fn add_value(&mut self, bytes: &[u8]) -> Option<SlotId> {
-        todo!("Your code here")
+        let mut header = self.get_page_header();
+        let has_free = header.active_slot_count < header.alloc_slot_count;
+        let (slot_id, reused) = if has_free {
+            let i = (0..header.alloc_slot_count)
+                .find(|&i| self.get_slot_header(i).valid == 0)
+                .expect("invariant violated: active<alloc but no free slot");
+            (i, true)
+        } else {
+            (header.alloc_slot_count, false)
+        };
+        let slot_header_overhead = if reused { 0 } else { 6 };
+        let space_needed = bytes.len() + slot_header_overhead;
+        if self.get_free_space() < space_needed {
+            return None;
+        }
+
+        let space_between_metadata_data =
+            PAGE_SIZE - (self.get_header_size() + header.slot_boundary as usize);
+        // Not enough space between metadata and data to insert the new data (+ potential header), let's reclaim
+        if space_between_metadata_data < bytes.len() + slot_header_overhead {
+            self.recompact();
+            return self.add_value(bytes);
+        } else {
+            let start = PAGE_SIZE - header.slot_boundary as usize - bytes.len();
+            self.data[start..start + bytes.len()].copy_from_slice(bytes);
+
+            let sh = SlotHeader {
+                offset: header.slot_boundary + bytes.len() as Offset,
+                length: bytes.len() as Offset,
+                valid: 1,
+                pad: 1,
+            };
+            self.write_slot_header(slot_id, sh);
+
+            header.slot_boundary += bytes.len() as Offset;
+            if !reused {
+                header.alloc_slot_count += 1;
+            }
+            header.active_slot_count += 1;
+            self.write_page_header(header);
+        }
+        Some(slot_id)
     }
 
     /// Return the bytes for the slotId. If the slotId is not valid then return None
     fn get_value(&self, slot_id: SlotId) -> Option<Vec<u8>> {
-        todo!("Your code here")
+        let header = self.get_page_header();
+
+        if slot_id >= header.alloc_slot_count || self.get_slot_header(slot_id).valid != 1 {
+            None
+        } else {
+            let slot_header = self.get_slot_header(slot_id);
+            let start = PAGE_SIZE - slot_header.offset as usize;
+            Some(self.data[start..start + slot_header.length as usize].to_vec())
+        }
     }
 
     /// Delete the bytes/slot for the slotId. If the slotId is not valid then return None
@@ -45,7 +164,21 @@ impl HeapPage for Page {
     /// The space for the value should be free to use for a later added value.
     /// HINT: Return Some(()) for a valid delete
     fn delete_value(&mut self, slot_id: SlotId) -> Option<()> {
-        todo!("Your code here")
+        let mut page_header = self.get_page_header();
+        if slot_id >= page_header.alloc_slot_count {
+            None
+        } else {
+            let mut slot_header = self.get_slot_header(slot_id);
+            if slot_header.valid != 1 {
+                None
+            } else {
+                slot_header.valid = 0;
+                self.write_slot_header(slot_id, slot_header);
+                page_header.active_slot_count -= 1;
+                self.write_page_header(page_header);
+                Some(())
+            }
+        }
     }
 
     /// A utility function to determine the size of the header in the page
@@ -53,7 +186,7 @@ impl HeapPage for Page {
     /// Will be used by tests.
     #[allow(dead_code)]
     fn get_header_size(&self) -> usize {
-        todo!("Your code here")
+        self.get_page_header().alloc_slot_count as usize * 6 + 8
     }
 
     /// A utility function to determine the total current free space in the page.
@@ -61,7 +194,65 @@ impl HeapPage for Page {
     /// Will be used by tests.
     #[allow(dead_code)]
     fn get_free_space(&self) -> usize {
-        todo!("Your code here")
+        let page_header = HeapPageHeader::from_bytes(&self.data);
+        let mut occupied_space = self.get_header_size();
+        for i in 0..page_header.alloc_slot_count {
+            let slot_header = self.get_slot_header(i);
+            if slot_header.valid == 1 {
+                occupied_space += slot_header.length as usize;
+            }
+        }
+        PAGE_SIZE - occupied_space
+    }
+
+    fn get_page_header(&self) -> HeapPageHeader {
+        HeapPageHeader::from_bytes(&self.data)
+    }
+
+    fn write_page_header(&mut self, header: HeapPageHeader) {
+        let bytes = header.to_bytes();
+        self.data[..8].copy_from_slice(&bytes);
+    }
+
+    fn get_slot_header(&self, slot_id: SlotId) -> SlotHeader {
+        let page_header = HeapPageHeader::from_bytes(&self.data);
+        assert!(slot_id < page_header.alloc_slot_count);
+        let byte_index = 8 + 6 * slot_id as usize;
+        SlotHeader::from_bytes(&self.data[byte_index..byte_index + 6])
+    }
+
+    fn get_slot_data(&self, slot_id: SlotId) -> &[u8] {
+        let header = self.get_slot_header(slot_id);
+        let start_idx = PAGE_SIZE - header.offset as usize;
+        &self.data[start_idx..start_idx + header.length as usize]
+    }
+
+    fn write_slot_header(&mut self, slot_id: SlotId, header: SlotHeader) {
+        let bytes_index = 8 + slot_id as usize * 6;
+        let bytes = header.to_bytes();
+        self.data[bytes_index..bytes_index + 6].copy_from_slice(&bytes);
+    }
+
+    fn recompact(&mut self) {
+        let mut header = self.get_page_header();
+        let mut new_bytes = [0u8; PAGE_SIZE];
+        let mut cur_slot_boundary = 0;
+        for i in 0..header.alloc_slot_count {
+            let mut slot_header = self.get_slot_header(i);
+            if slot_header.valid == 1 {
+                let start_idx =
+                    PAGE_SIZE - cur_slot_boundary as usize - slot_header.length as usize;
+                new_bytes[start_idx..start_idx + slot_header.length as usize]
+                    .copy_from_slice(self.get_slot_data(i));
+                slot_header.offset = cur_slot_boundary + slot_header.length as Offset;
+                cur_slot_boundary += slot_header.length;
+                self.write_slot_header(i, slot_header);
+            }
+        }
+        self.data[PAGE_SIZE - cur_slot_boundary as usize..PAGE_SIZE]
+            .copy_from_slice(&new_bytes[PAGE_SIZE - cur_slot_boundary as usize..PAGE_SIZE]);
+        header.slot_boundary = cur_slot_boundary;
+        self.write_page_header(header);
     }
 }
 
@@ -69,7 +260,7 @@ impl HeapPage for Page {
 /// This should iterate through all valid values of the page.
 pub struct HeapPageIntoIter {
     page: Page,
-    // todo!("Add any fields you need here")
+    cur_slot_id: SlotId,
 }
 
 /// The implementation of the (consuming) page iterator.
@@ -79,7 +270,16 @@ impl Iterator for HeapPageIntoIter {
     type Item = (Vec<u8>, SlotId);
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!("Your code here")
+        let slot_count = self.page.get_page_header().alloc_slot_count;
+        while self.cur_slot_id < slot_count {
+            let id = self.cur_slot_id;
+            self.cur_slot_id += 1;
+
+            if let Some(data) = self.page.get_value(id) {
+                return Some((data, id));
+            }
+        }
+        None
     }
 }
 
@@ -91,7 +291,10 @@ impl IntoIterator for Page {
     type IntoIter = HeapPageIntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        todo!("Your code here")
+        HeapPageIntoIter {
+            page: self,
+            cur_slot_id: 0,
+        }
     }
 }
 
